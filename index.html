@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Вход в проект</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 32px 18px; font: 16px/1.5 system-ui, sans-serif; color: #20252b; background: #f4f6f8; }
+        main { max-width: 680px; margin: auto; }
+        section, details { background: white; border: 1px solid #dce2e7; border-radius: 12px; padding: 22px; margin-bottom: 18px; }
+        h1 { margin: 0 0 6px; font-size: 28px; } h2 { margin: 0 0 14px; font-size: 20px; }
+        p { margin: 10px 0; } label { display: block; margin-top: 12px; }
+        input { width: 100%; padding: 10px; border: 1px solid #aab5bf; border-radius: 7px; font: inherit; }
+        button { font: inherit; cursor: pointer; border: 1px solid #bcc6ce; border-radius: 7px; padding: 10px 16px; background: #fff; color: #20252b; }
+        button:hover { background: #edf4f1; } button:disabled { opacity: .55; cursor: wait; }
+        .buttons { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+        .primary { background: #207653; color: white; border-color: #207653; }
+        .primary:hover { background: #195e42; } .muted { color: #586572; font-size: 14px; }
+        .notice { border-left: 4px solid #ad7500; background: #fff8df; padding: 12px; margin: 16px 0; }
+        code { overflow-wrap: anywhere; font-size: 14px; } summary { cursor: pointer; font-weight: 600; }
+        [role="status"], [role="alert"] { overflow-wrap: anywhere; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+<main>
+    <section aria-labelledby="auth-title">
+        <h1 id="auth-title">Вход в аккаунт</h1>
+        <p class="muted">Войти через Google или GitHub</p>
+        <p class="muted">При первом входе аккаунт создаётся автоматически.</p>
+        <div id="local-notice" class="notice" hidden>
+            Для входа откроется защищённая страница проекта в интернете. Локальный сервер запускать не требуется.
+        </div>
+        <div id="login-panel">
+            <p>Выбери аккаунт, с которым хочешь войти.</p>
+            <div class="buttons">
+                <button id="google-button" type="button" onclick="login('google')">Войти через Google</button>
+                <button id="github-button" type="button" onclick="login('github')">Войти через GitHub</button>
+            </div>
+        </div>
+        <div id="account-panel" hidden>
+            <p>Вы вошли: <strong id="account-name"></strong></p>
+            <p id="account-email" class="muted"></p>
+            <button id="logout-button" type="button" onclick="logout()">Выйти из аккаунта</button>
+        </div>
+        <p id="auth-status" role="status" aria-live="polite">Проверяем вход…</p>
+    </section>
+
+</main>
+
+<!-- Та же библиотека Supabase JS 2, что использовалась в исходном файле. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+    const SITE_URL = "https://shcherbakov23.github.io/test/";
+    const DEFAULT_CONNECTION = {
+        url: "https://cjqsglshfgyuepjhbzrr.supabase.co",
+        key: "sb_publishable_lXkNhSHyOVHdCyO1rfH1Uw_KRr8ceMH"
+    };
+    const CONNECTION_STORAGE = "user-form-supabase-connection-v2";
+    let connection = { ...DEFAULT_CONNECTION };
+    let db;
+    let saving = false;
+    let authBusy = false;
+    let authSubscription;
+    const byId = id => document.getElementById(id);
+    const isWeb = () => location.protocol === "http:" || location.protocol === "https:";
+    const redirectUrl = () => isWeb()
+        ? location.origin + location.pathname
+        : "Адрес будет показан при открытии опубликованной страницы";
+
+    function validateConnection(value) {
+        const url = new URL(value.url);
+        if (url.protocol !== "https:" || !url.hostname.endsWith(".supabase.co") ||
+            url.username || url.password || (url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) {
+            throw new Error("Вставь Project URL вида https://PROJECT_ID.supabase.co");
+        }
+        const key = value.key.trim();
+        if (key.startsWith("sb_secret_")) throw new Error("Нужен публичный Publishable key, а не Secret key.");
+        if (key.startsWith("eyJ")) {
+            let payload;
+            try {
+                const part = key.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+                payload = JSON.parse(atob(part));
+            } catch (_) { throw new Error("Не удалось прочитать anon key. Скопируй его целиком."); }
+            if (payload.role !== "anon") throw new Error("Используй публичный anon key. service_role здесь недопустим.");
+        } else if (!/^sb_publishable_[A-Za-z0-9_-]+$/.test(key)) {
+            throw new Error("Вставь Publishable key, который начинается с sb_publishable_.");
+        }
+        return { url: url.origin, key };
+    }
+
+    function setAuthBusy(value) {
+        authBusy = value;
+        byId("google-button").disabled = value || !db;
+        byId("github-button").disabled = value || !db;
+        byId("logout-button").disabled = value || !db;
+    }
+
+    function renderSession(session) {
+        const user = session && session.user;
+        byId("login-panel").hidden = !!user;
+        byId("account-panel").hidden = !user;
+        byId("account-name").textContent = user
+            ? (user.user_metadata && (user.user_metadata.full_name || user.user_metadata.user_name)) || user.email || user.id
+            : "";
+        byId("account-email").textContent = user && user.email || "";
+    }
+
+    function friendlyError(error) {
+        const message = error && error.message || String(error);
+        if (/provider.*(not enabled|disabled)|unsupported provider/i.test(message)) {
+            return "Этот способ входа ещё не включён. В Supabase открой Authentication → Sign In / Providers и настрой выбранный сервис.";
+        }
+        if (/fetch|network/i.test(message)) return "Не удалось связаться с Supabase. Проверь интернет, Project URL и состояние проекта.";
+        return message;
+    }
+
+    async function login(provider) {
+        if (authBusy) return;
+        if (!["google", "github"].includes(provider)) return;
+        if (!isWeb()) {
+            location.assign(SITE_URL + "?login=" + provider);
+            return;
+        }
+        if (!db) return;
+        setAuthBusy(true);
+        byId("auth-status").textContent = "Открываем " + (provider === "google" ? "Google" : "GitHub") + "…";
+        try {
+            const { data, error } = await db.auth.signInWithOAuth({
+                provider,
+                options: { redirectTo: redirectUrl(), skipBrowserRedirect: true }
+            });
+            if (error) throw error;
+            if (!data || !data.url) throw new Error("Supabase не вернул адрес для входа.");
+            // Перенаправление выполняется только после проверки ответа SDK.
+            location.assign(data.url);
+        } catch (error) {
+            byId("auth-status").textContent = "Ошибка входа: " + friendlyError(error);
+            setAuthBusy(false);
+        }
+    }
+
+    async function logout() {
+        if (!db || authBusy) return;
+        setAuthBusy(true);
+        try {
+            const { error } = await db.auth.signOut({ scope: "local" });
+            if (error) throw error;
+            renderSession(null);
+            byId("auth-status").textContent = "Вы вышли из аккаунта.";
+        } catch (error) {
+            byId("auth-status").textContent = "Ошибка выхода: " + friendlyError(error);
+        } finally { setAuthBusy(false); }
+    }
+
+    async function initialize() {
+        byId("local-notice").hidden = isWeb();
+        setAuthBusy(true);
+        try {
+            if (!window.supabase) throw new Error("Библиотека Supabase не загрузилась. Проверь интернет и обнови страницу.");
+            db = window.supabase.createClient(connection.url, connection.key, {
+                auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "implicit" }
+            });
+            const listener = db.auth.onAuthStateChange((event, session) => {
+                renderSession(session);
+                if (event === "SIGNED_IN") byId("auth-status").textContent = "Вход выполнен через Supabase.";
+                if (event === "SIGNED_OUT") byId("auth-status").textContent = "Вы вышли из аккаунта.";
+            });
+            authSubscription = listener.data.subscription;
+            const { data, error } = await db.auth.getSession();
+            if (error) throw error;
+            renderSession(data.session);
+            byId("auth-status").textContent = data.session ? "Вход выполнен через Supabase." : "Вы ещё не вошли.";
+        } catch (error) {
+            byId("auth-status").textContent = friendlyError(error);
+        } finally { setAuthBusy(false); }
+        const query = new URLSearchParams(location.search);
+        const hash = new URLSearchParams(location.hash.slice(1));
+        const oauthError = query.get("error_description") || hash.get("error_description");
+        if (oauthError) {
+            byId("auth-status").textContent = "Вход не завершён: " + oauthError;
+            // Убираем параметры неудачного входа, чтобы повторное открытие не показывало старую ошибку.
+            try { history.replaceState(null, "", location.pathname); } catch (_) {}
+        }
+        const intent = query.get("login");
+        if (!oauthError && isWeb() && ["google", "github"].includes(intent)) {
+            history.replaceState(null, "", location.pathname);
+            if (byId("account-panel").hidden) await login(intent);
+        }
+    }
+
+    window.addEventListener("pageshow", event => {
+        if (event.persisted) setAuthBusy(false);
+    });
+    globalThis.authReady = initialize();
+</script>
+</body>
+</html>
